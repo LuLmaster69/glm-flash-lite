@@ -204,6 +204,8 @@ def iterate_gen_la(gen, results, draft_tokens=None, _orig=None):
         # first eligible step: stock-equivalent launch with host ids
         job = gen.active_jobs[0]
         seq = job.sequences[0]
+        # a fully cached prompt (e.g. a requeue) never sets this, so prefill() could skip past the last token
+        seq.prefill_complete = True
         ids = job.get_input_ids_list(None, 0, add_to_cache=True)[0]
         par = st.par
         pin = st.tok_pin[par]
