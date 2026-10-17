@@ -1,0 +1,204 @@
+// ftx: GPU side of the CPU expert tier on Intel Xe2 (Arc Pro B70) -- SYCL port of glm-flash-lite
+// kernels/cpu_avx2/ft_tier_cu.cu (MIT). Two kernels per MoE layer in decode (M <= 4 rows, pair mode), both on the
+// compute queue, no host sync, graph-capturable:
+//   ftx_split   after the router: hits / misses from the device expert cache's slot map; misses ordered coldest first
+//               by a static score; n_cpu from the cost model; the CPU job (x rows as fp16, picks, layer) is written to
+//               USM host memory, then the job seq is published (system-scope release). The GPU selection gets id -1 /
+//               weight 0 for CPU picks (exl3_moe skips them: no zero-copy read, no cache admission).
+//   ftx_combine after the GPU experts: bounded spin on the worker's done seq (host memory, system-scope acquire),
+//               then out += fp32 partial. A spin that exceeds `max_spin` polls gives up (stats[6]++) instead of
+//               running into the xe job timeout.
+// Sequence numbers come from a device counter (seq[0]), so graph replays publish fresh, monotonic seqs.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+#include <sycl/ext/oneapi/experimental/annotated_ptr/annotated_ptr.hpp>
+
+namespace ftx {
+using bf16 = sycl::ext::oneapi::bfloat16;
+using fp16 = sycl::half;
+using sys_ref64 = sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                   sycl::access::address_space::global_space>;
+
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+// policy p[]: 0 t_zc, 1 t_hit, 2 cpu_a, 3 cpu_b, 4 cpu_tok, 5 max_cpu, 6 force_n (-1 = model), 7 handshake
+template <typename TX>
+static void split_impl(sycl::queue& q, const int* ids, const float* w, const TX* x, int M, int topk, int H, int E,
+                       const int* slot_of, float* score, const float* p, int64_t* ctrl, fp16* hx, int* hpicks,
+                       int64_t* seq, int li, int* ids_out, float* w_out, int64_t* dflag, int64_t* stats) {
+    constexpr int WG = 256;
+    const int n = M * topk;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> cnt(sycl::range<1>(1024), h), miss(sycl::range<1>(1024), h);
+        sycl::local_accessor<unsigned char, 1> cpu(sycl::range<1>(1024), h);
+        sycl::local_accessor<int, 1> sc(sycl::range<1>(4), h);
+        sycl::local_accessor<int64_t, 1> sq(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int t = it.get_local_id(0);
+            auto g = it.get_group();
+            using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                          sycl::access::address_space::local_space>;
+            for (int e = t; e < E; e += WG) { cnt[e] = 0; cpu[e] = 0; }
+            sycl::group_barrier(g);
+            for (int s = t; s < n; s += WG) {
+                int e = ids[s];
+                if (w[s] != 0.0f && e >= 0 && e < E) lref(cnt[e]).fetch_add(1);
+            }
+            sycl::group_barrier(g);
+            if (t == 0) {
+                int nm = 0, nh = 0;
+                for (int e = 0; e < E; ++e) {
+                    if (!cnt[e]) continue;
+                    if (slot_of[e] >= 0) { ++nh; continue; }
+                    int b = nm++;
+                    while (b > 0 && score[miss[b - 1]] > score[e]) { miss[b] = miss[b - 1]; --b; }
+                    miss[b] = e;
+                }
+                int best = 0;
+                const int force = (int)p[6];
+                const int maxc = sycl::min((int)p[5], nm);
+                if (force >= 0) best = sycl::min(force, nm);
+                else {
+                    float bt = 1e30f, c = 0.0f;
+                    for (int k = 0; k <= maxc; ++k) {
+                        if (k) c += p[3] * (1.0f + p[4] * (cnt[miss[k - 1]] - 1));
+                        const float gpu = p[1] * (nh + nm - k) + p[0] * (nm - k);
+                        const float tt = sycl::fmax(gpu, k ? p[2] + c : 0.0f);
+                        if (tt < bt - 1e-6f) { bt = tt; best = k; }
+                    }
+                }
+                for (int k = 0; k < best; ++k) cpu[miss[k]] = 1;
+                int publish = best > 0 || p[7] > 0.5f;
+                stats[0] += nh; stats[1] += nm; stats[2] += best; stats[3] += 1;
+                int npk = 0;
+                if (publish)
+                    for (int s = 0; s < n; ++s) {
+                        int e = ids[s];
+                        if (e < 0 || e >= E || !cpu[e] || w[s] == 0.0f) continue;
+                        hpicks[npk * 3] = s / topk; hpicks[npk * 3 + 1] = e;
+                        hpicks[npk * 3 + 2] = sycl::bit_cast<int>(w[s]);
+                        ++npk;
+                    }
+                for (int e = 0; e < E; ++e) if (cnt[e]) score[e] += (float)cnt[e];   // online routing frequency
+                sc[0] = publish; sc[1] = npk;
+                sq[0] = publish ? ++seq[0] : 0;
+            }
+            sycl::group_barrier(g);
+            for (int s = t; s < n; s += WG) {
+                int e = ids[s];
+                bool c = e >= 0 && e < E && cpu[e];
+                ids_out[s] = c ? -1 : e;
+                w_out[s] = c ? 0.0f : w[s];
+            }
+            if (sc[0]) {
+                for (int i = t; i < M * H; i += WG) hx[i] = fp16(float(x[i]));
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                sycl::group_barrier(g);
+                if (t == 0) {
+                    ctrl[2] = li; ctrl[3] = M; ctrl[4] = sc[1];
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    sys_ref64(ctrl[0]).store(sq[0]);
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    dflag[0] = sq[0];
+                }
+            } else if (t == 0) dflag[0] = 0;
+        });
+    });
+}
+
+std::vector<at::Tensor> ftx_split(at::Tensor ids, at::Tensor w, at::Tensor x, at::Tensor slot_of, int64_t layer, int64_t E,
+                                  at::Tensor score, at::Tensor pol, int64_t ctrl, int64_t hx, int64_t hpicks, at::Tensor seq,
+                                  at::Tensor dflag, at::Tensor stats) {
+    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && w.scalar_type() == at::kFloat && w.is_contiguous());
+    TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && E <= 1024);
+    const int M = x.size(0), H = x.size(1), topk = ids.numel() / M;
+    auto ids_out = at::empty_like(ids);
+    auto w_out = at::empty_like(w);
+    auto& q = queue_of(x);
+    const int* so = slot_of.data_ptr<int>() + layer * E;
+    float* scp = score.data_ptr<float>() + layer * E;
+#define FTX_SPLIT(T) split_impl<T>(q, ids.data_ptr<int>(), w.data_ptr<float>(), reinterpret_cast<const T*>(x.data_ptr()), M, topk, H, \
+        (int)E, so, scp, pol.data_ptr<float>(), reinterpret_cast<int64_t*>(ctrl), reinterpret_cast<fp16*>(hx), \
+        reinterpret_cast<int*>(hpicks), seq.data_ptr<int64_t>(), (int)layer, ids_out.data_ptr<int>(), w_out.data_ptr<float>(), \
+        dflag.data_ptr<int64_t>(), stats.data_ptr<int64_t>())
+    if (x.scalar_type() == at::kBFloat16) FTX_SPLIT(bf16);
+    else if (x.scalar_type() == at::kHalf) FTX_SPLIT(fp16);
+    else TORCH_CHECK(false, "ftx_split: x bf16/fp16");
+#undef FTX_SPLIT
+    return {ids_out, w_out};
+}
+
+template <typename TO>
+static void combine_impl(sycl::queue& q, TO* out, int n, const int64_t* dflag, int64_t* ctrl, const float* hout,
+                         int64_t* stats, int64_t max_spin) {
+    // poll_mode: 0 system-scope atomic load, 1 atomic RMW (fetch_add 0), 2 load with uncached L1/L2/L3 read hints
+    const int poll_mode = (int)((max_spin >> 40) & 0xff);
+    max_spin &= (int64_t(1) << 40) - 1;
+    constexpr int WG = 256;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> go(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int t = it.get_local_id(0);
+            if (t == 0) {
+                const int64_t s = dflag[0];
+                int ok = s != 0;
+                if (ok) {
+                    int64_t k = 0;
+                    // plain system-scope loads of host USM return a stale (device-cached) value while spinning on
+                    // Xe2; an atomic RMW (fetch_add 0) is performed at the host memory and sees the worker's store.
+                    namespace ie = sycl::ext::intel::experimental;
+                    namespace oe = sycl::ext::oneapi::experimental;
+                    using UC = ie::cache_control<ie::cache_mode::uncached, ie::cache_level::L1, ie::cache_level::L2, ie::cache_level::L3>;
+                    oe::annotated_ptr<volatile int64_t, decltype(oe::properties{ie::read_hint<UC>})> up(ctrl + 1);
+                    auto rd = [&]() -> int64_t {
+                        if (poll_mode == 1) return sys_ref64(ctrl[1]).fetch_add(0);
+                        if (poll_mode == 2) return up[0];
+                        return sys_ref64(ctrl[1]).load();
+                    };
+                    while (rd() < s) {
+                        if (++k > max_spin) { ok = 0; stats[6] += 1; break; }
+                    }
+                    stats[4] += k; stats[5] += 1;
+                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                }
+                go[0] = ok;
+            }
+            sycl::group_barrier(it.get_group());
+            if (!go[0]) return;
+            for (int i = t; i < n; i += WG) {
+                float v = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                           sycl::access::address_space::global_space>(*const_cast<float*>(hout + i)).load();
+                out[i] = TO(float(out[i]) + v);
+            }
+        });
+    });
+}
+
+void ftx_combine(at::Tensor out, at::Tensor dflag, int64_t ctrl, int64_t hout, at::Tensor stats, int64_t max_spin) {
+    TORCH_CHECK(out.is_contiguous());
+    auto& q = queue_of(out);
+    const int n = out.numel();
+    if (out.scalar_type() == at::kBFloat16)
+        combine_impl<bf16>(q, reinterpret_cast<bf16*>(out.data_ptr()), n, dflag.data_ptr<int64_t>(), reinterpret_cast<int64_t*>(ctrl),
+                           reinterpret_cast<const float*>(hout), stats.data_ptr<int64_t>(), max_spin);
+    else if (out.scalar_type() == at::kHalf)
+        combine_impl<fp16>(q, reinterpret_cast<fp16*>(out.data_ptr()), n, dflag.data_ptr<int64_t>(), reinterpret_cast<int64_t*>(ctrl),
+                           reinterpret_cast<const float*>(hout), stats.data_ptr<int64_t>(), max_spin);
+    else if (out.scalar_type() == at::kFloat)
+        combine_impl<float>(q, out.data_ptr<float>(), n, dflag.data_ptr<int64_t>(), reinterpret_cast<int64_t*>(ctrl),
+                            reinterpret_cast<const float*>(hout), stats.data_ptr<int64_t>(), max_spin);
+    else TORCH_CHECK(false, "ftx_combine: out dtype");
+}
+
+}  // namespace ftx
+
+TORCH_LIBRARY(ftx, m) {
+    m.def("split(Tensor ids, Tensor w, Tensor x, Tensor slot_of, int layer, int E, Tensor(d!) score, Tensor pol, int ctrl, int hx, "
+          "int hpicks, Tensor(a!) seq, Tensor(b!) dflag, Tensor(c!) stats) -> Tensor[]");
+    m.impl("split", torch::kXPU, &ftx::ftx_split);
+    m.def("combine(Tensor(a!) out, Tensor dflag, int ctrl, int hout, Tensor(b!) stats, int max_spin) -> ()");
+    m.impl("combine", torch::kXPU, &ftx::ftx_combine);
+}
