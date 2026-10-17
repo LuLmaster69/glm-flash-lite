@@ -1,0 +1,281 @@
+{
+ "card": "intel-arc-pro-b70-32gb",
+ "config": "G262-I0s800c1k glm53 ftx 262k",
+ "started": "2026-10-17T12:22:57+0200",
+ "ctx_len": 262144,
+ "protocol": "bench/sweep.py v1",
+ "api": "sglang",
+ "tol": 0.05,
+ "best_known_before": {
+  "prefill_8192": 1022.7,
+  "prefill_16384": 946.4,
+  "prefill_32768": 799.6,
+  "prefill_65536": 603.6,
+  "decode_C1": 32.83
+ },
+ "server_args": {
+  "max_running_requests": 4,
+  "max_total_num_tokens": 270336,
+  "chunked_prefill_size": 1024,
+  "kv_cache_dtype": "fp8_e4m3",
+  "context_length": 262144,
+  "mem_fraction_static": 0.88,
+  "max_mamba_cache_size": 24
+ },
+ "prefill": {
+  "8192": {
+   "median": 189.4,
+   "min": 189.4,
+   "max": 189.4,
+   "n": 3,
+   "all": [
+    189.4,
+    189.4,
+    189.4
+   ]
+  },
+  "16384": {
+   "median": 173.6,
+   "min": 173.6,
+   "max": 173.6,
+   "n": 3,
+   "all": [
+    173.6,
+    173.6,
+    173.6
+   ]
+  },
+  "32768": {
+   "median": 147.2,
+   "min": 147.1,
+   "max": 147.2,
+   "n": 3,
+   "all": [
+    147.2,
+    147.1,
+    147.2
+   ]
+  },
+  "65536": {
+   "median": 111.6,
+   "min": 111.6,
+   "max": 111.6,
+   "n": 3,
+   "all": [
+    111.6,
+    111.6,
+    111.6
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 17.52,
+    "min": 17.24,
+    "max": 17.8,
+    "n": 2,
+    "all": [
+     17.8,
+     17.24
+    ]
+   },
+   "per_stream_mean": {
+    "median": 17.509999999999998,
+    "min": 17.23,
+    "max": 17.79,
+    "n": 2,
+    "all": [
+     17.79,
+     17.23
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 17.8,
+     "per_stream_mean": 17.79,
+     "per_stream_min": 17.79,
+     "tokens": 2095,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 9.34
+    },
+    {
+     "aggregate": 17.24,
+     "per_stream_mean": 17.23,
+     "per_stream_min": 17.23,
+     "tokens": 2919,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.59
+    }
+   ],
+   "gpu_power_w_mean": null
+  },
+  "C2": {
+   "aggregate": {
+    "median": 21.494999999999997,
+    "min": 19.52,
+    "max": 23.47,
+    "n": 2,
+    "all": [
+     23.47,
+     19.52
+    ]
+   },
+   "per_stream_mean": {
+    "median": 12.600000000000001,
+    "min": 11.98,
+    "max": 13.22,
+    "n": 2,
+    "all": [
+     11.98,
+     13.22
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 23.47,
+     "per_stream_mean": 11.98,
+     "per_stream_min": 11.86,
+     "tokens": 3235,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.12
+    },
+    {
+     "aggregate": 19.52,
+     "per_stream_mean": 13.22,
+     "per_stream_min": 11.48,
+     "tokens": 5854,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 4.45
+    }
+   ],
+   "gpu_power_w_mean": null
+  },
+  "C3": {
+   "aggregate": {
+    "median": 20.705,
+    "min": 20.56,
+    "max": 20.85,
+    "n": 2,
+    "all": [
+     20.85,
+     20.56
+    ]
+   },
+   "per_stream_mean": {
+    "median": 7.96,
+    "min": 7.82,
+    "max": 8.1,
+    "n": 2,
+    "all": [
+     8.1,
+     7.82
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 20.85,
+     "per_stream_mean": 8.1,
+     "per_stream_min": 7.09,
+     "tokens": 6013,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.01
+    },
+    {
+     "aggregate": 20.56,
+     "per_stream_mean": 7.82,
+     "per_stream_min": 7.1,
+     "tokens": 5949,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 4.71
+    }
+   ],
+   "gpu_power_w_mean": null
+  },
+  "C4": {
+   "aggregate": {
+    "median": 24.46,
+    "min": 23.12,
+    "max": 25.8,
+    "n": 2,
+    "all": [
+     25.8,
+     23.12
+    ]
+   },
+   "per_stream_mean": {
+    "median": 6.915,
+    "min": 6.67,
+    "max": 7.16,
+    "n": 2,
+    "all": [
+     6.67,
+     7.16
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 25.8,
+     "per_stream_mean": 6.67,
+     "per_stream_min": 6.53,
+     "tokens": 6690,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 5.33
+    },
+    {
+     "aggregate": 23.12,
+     "per_stream_mean": 7.16,
+     "per_stream_min": 6.49,
+     "tokens": 9587,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 4.81
+    }
+   ],
+   "gpu_power_w_mean": null
+  }
+ },
+ "status": "RUNNING",
+ "gates": {
+  "prefill_8192": {
+   "value": 189.4,
+   "best_known": 1022.7,
+   "pass": false
+  },
+  "prefill_16384": {
+   "value": 173.6,
+   "best_known": 946.4,
+   "pass": false
+  },
+  "prefill_32768": {
+   "value": 147.2,
+   "best_known": 799.6,
+   "pass": false
+  },
+  "prefill_65536": {
+   "value": 111.6,
+   "best_known": 603.6,
+   "pass": false
+  },
+  "decode_C1": {
+   "value": 17.52,
+   "best_known": 32.83,
+   "pass": false
+  }
+ }
+}
