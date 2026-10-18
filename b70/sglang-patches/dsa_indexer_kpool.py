@@ -812,9 +812,23 @@ class IndexerKPool(MultiPlatformOp):
                       f"sle={_sle[:8].tolist()}", flush=True)
             pool_seqlens = _mine
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], blocksize, 1, 132
-        )
+        # glm53-b70: the index-K pool pages hold 64 fp8 keys followed by 64 fp32 scales (DeepGEMM layout, as written
+        # by the kpool compress kernels and read by gather_index_k_scale_prefix_into), but sgl_kernel's XPU
+        # fp8_paged_mqa_logits reads each token as 128 key bytes + 4 scale bytes interleaved. Repack the pages this
+        # batch references into the interleaved layout (static shapes: graph-capturable) and index them densely.
+        _pg = kv_cache_fp8.reshape(kv_cache_fp8.shape[0], -1)
+        if _pg.dtype != torch.uint8:
+            _pg = _pg.view(torch.uint8)
+        _rows, _nb = pool_block_tables.shape
+        _sel = _pg.index_select(0, pool_block_tables.reshape(-1).clamp(min=0).to(torch.int64))
+        _keys = _sel[:, : blocksize * 128].reshape(-1, blocksize, 128)
+        _scl = _sel[:, blocksize * 128 : blocksize * 132].reshape(-1, blocksize, 4)
+        kv_cache_fp8 = torch.cat([_keys, _scl], dim=-1).reshape(_rows * _nb, blocksize, 1, 132)
+        if kv_cache_fp8.dtype != _pg.dtype:
+            kv_cache_fp8 = kv_cache_fp8.view(_pg.dtype)
+        _dbg_bt = pool_block_tables
+        pool_block_tables = torch.arange(_rows * _nb, device=pool_block_tables.device,
+                                         dtype=pool_block_tables.dtype).reshape(_rows, _nb)
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 

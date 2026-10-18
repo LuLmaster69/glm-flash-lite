@@ -39,6 +39,17 @@ packed experts in USM host memory (42 layers x 2.729 GB = 114.6 GB) are allocate
 them to the cgroup. Plan on about 260 GB of free host RAM, the `--memory` the run used. Nobody has measured a
 system-wide MemAvailable drop for this config yet.
 
+Long context (fixed after G262-I0s800c1k): the XPU decode indexer called `sgl_kernel.fp8_paged_mqa_logits` on the
+index-K pool pages, which hold 64 fp8 keys followed by 64 fp32 scales (the layout the kpool compress kernels write and
+`gather_index_k_scale_prefix_into` reads). The XPU kernel reads each token as 128 key bytes plus 4 scale bytes
+interleaved, so decode picked its 2,048 history tokens close to at random once a prompt passed about 3k tokens. A
+needle test (thinking off, temperature 0) failed from 5k tokens up and returned only the first digits of the code.
+`_get_topk_paged_xpu` now repacks the pooled pages the batch references into the interleaved layout (static shapes, so
+decode graphs still capture). A torch reference over the same pages now matches the kernel logits (correlation 1.000,
+top-512 overlap 512/512 on all 11 indexer layers), and the needle passes at 7k, 18k, 36k and 68k tokens. Prefill was
+not affected: its ragged path gathers keys and scales separately. Note that GLM-5.3's chat template has no
+`enable_thinking` switch; a thinking-off request needs the prompt rendered with an empty `<think></think>`.
+
 Prefill is slow because the DPAS prefill MoE kernel is off for M < 256 (`GLM_MOE_PREFILL_MIN_M=256`) and prefill reads
 the experts zero-copy over PCIe. Decode is bound by expert misses.
 
