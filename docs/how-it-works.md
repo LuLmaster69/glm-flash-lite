@@ -17,6 +17,7 @@ Code map:
 | `glm53/expert_cache.py` | VRAM CLOCK cache, prefill staging, elastic slots |
 | `glm53/nv_tier.py` | loader that skips the expert bytes, store manifest |
 | `scripts/pack_glm53_store.py` | builds and verifies the store |
+| `glm53/ablit.py` | optional refusal-direction projection (`EXL3_ABLIT_RUNTIME`), off by default |
 
 ## The three tiers
 
@@ -327,6 +328,79 @@ Otherwise `preflight.py cpus` derives a layout from the CPUs the container has:
 It logs the result as `[glm53] nv2 CPU layout, ...`. Speed with a derived layout is not measured. Variables you set
 yourself are kept, and must lie inside the CPU set.
 
+## Optional: refusal-direction projection (`EXL3_ABLIT_RUNTIME`)
+
+**What it does.** The server can apply the runtime edit published as
+[yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored).
+The edit is two small files and no weights:
+
+- `uncensor_spec.json` (3 KB): per-layer strengths `attn_w[L]` and `mlp_w[L]`.
+- `uncensor_direction.st` (16 KB): one unit vector `r`, 4,096 fp32 values in safetensors layout.
+
+After the attention and the MLP of layer L, the sublayer output `y` becomes `y - w_L * r (r . y)`, for every token,
+in prefill and decode. This happens before the mHC `hc_apply` mixes `y` into the four residual streams. It is the
+same as editing every writer weight as `W - w_L r r^T W`: the attention `o_proj`, and the dense, shared and routed
+expert `down_proj`. The published spec hooks the attention of layers 24-44 (w 2.14-2.21) and the MLP of layers
+11-38 (w 0.90-1.49). That is 49 sites on 34 blocks.
+
+**How it is wired.** `glm53/ablit.py` wraps `attn.forward` and `mlp.forward` of the main model's 45 decoder blocks.
+
+- The MoE output is complete when `BlockSparseMLP.forward` returns. The CPU-lane and NVMe->CPU partials and the
+  shared expert are already added, so every tier is covered.
+- The stock block forward and the fused `k_hcfuse` forward both see the projected output.
+- The MTP draft head is never edited.
+- Each site costs one fp32 GEMV and one rank-1 update, in place.
+- With no spec, nothing is installed, and every mode keeps its exactness.
+
+The lookup rules are the Kyojin engine's (`exllamav3/modules/ablit_runtime.py`), so the same files and switches work:
+
+| `EXL3_ABLIT_RUNTIME` | effect |
+|---|---|
+| unset (default) | on only if the model directory has `uncensor_spec.json` (with `uncensor_direction.st` next to it) |
+| `/path/to/spec.json` | that spec. The direction is the spec's `r_file`, else `<spec>.safetensors`, else `uncensor_direction.st` next to it |
+| `off`, `0`, `false`, `no`, `none` | off. `serve.py --no-uncensor` does the same |
+
+A missing or malformed spec stops the server at start, before the model loads, with an error that names the file.
+The log then prints:
+
+- ` -- ablit runtime: spec <path> active (...)`;
+- the sha256 of both files;
+- ` -- ablit runtime: 34 hooked blocks, 49 sites (...)`.
+
+`/stats` lists the spec, the hashes and the hooked layers. There is no runtime on/off switch. exllamav3 reuses cached
+KV pages and recurrent states across requests, so a switch would mix the two settings. To compare, restart with
+`EXL3_ABLIT_RUNTIME=off`.
+
+**Use it.** The published image does not contain this code. Build the image from this checkout
+(`docker build -f docker/Dockerfile -t glm53-flash-offload:ablit .`). Download only the two files, and keep serving the
+turboderp 3.05 bpw checkpoint: the yamz pack's weights are a different quantisation, and the NVMe store and the
+expert cache are built for the 3.05 bpw layout.
+
+```bash
+hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored uncensor_spec.json uncensor_direction.st \
+  --revision 4614256afd6187c095475fdfaa0e8789a117b504 --local-dir /data/glm53-ablit
+sha256sum /data/glm53-ablit/uncensor_spec.json /data/glm53-ablit/uncensor_direction.st
+#   fe9989cbce800f941ea46eac5200687fb961c51af607b4df9506c59c8b8f4d97  uncensor_spec.json
+#   7ca504e1fa94612c33451856e0bd33c483dd981462af7d9741b098772610c608  uncensor_direction.st
+# add to the README's docker run line:
+#   -v /data/glm53-ablit:/ablit:ro -e EXL3_ABLIT_RUNTIME=/ablit/uncensor_spec.json   (image glm53-flash-offload:ablit)
+```
+
+**Measured.** Nothing on this stack yet. The spec's authors fitted the direction on a 2.05 bpw quantisation and
+measured it on their own pack, on a Ryzen AI Max+ 395 with the Kyojin engine:
+
+- refusals on 100 harmful English prompts: 0/100 with the edit, 81/100 without (regex detector, 64 greedy tokens);
+- decode cost under 1 % (their estimate).
+
+On the 3.05 bpw checkpoint served here, the refusal rate, the quality cost and the speed cost are not measured.
+
+- Quality: `bench/score_ref_panel.py` (KL against stock exllamav3, which expects 1.0000 / 0 without the edit).
+- Speed: `bench/sweep.py`.
+
+Run each with and without the edit, in the same session. The edit is one global direction, so it lowers
+over-refusal on safe prompts too. It changes what the model will produce, and you are responsible for how you use
+it. Keep the API on 127.0.0.1.
+
 ## Settings
 
 These are the settings for the NVMe modes. Defaults are what the entrypoint sets for `GLM53_MODE=nvme`, with
@@ -359,5 +433,6 @@ These are the settings for the NVMe modes. Defaults are what the entrypoint sets
 | `GLM53_EC_MAX_SLOTS` | unset (no cap) | cap on VRAM cache slots; the README command sets 1376 |
 | `GLM53_EC_ELASTIC_GB` / `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN` | 10 / 2.6 / 512 | slots lent to prefill / staging buffer size / picks per layer that switch to staged prefill |
 | `GLM53_MAX_RQ_TOKENS` | 4096 (unset) | page-allocation round per job, not an output cap; lets C2/C4 decode together |
+| `EXL3_ABLIT_RUNTIME` | unset (on only if `/models/uncensor_spec.json` exists) | refusal-direction projection: a spec path, or `off`; see above. All modes |
 | `GLM53_PACK_THREADS` / `GLM53_PACK_SAMPLE` | 8 / 300 | `pack-store` threads / records byte-compared against the checkpoint |
 | `GLM53_MODEL_DIR`, `GLM53_MODEL_DOWNLOAD`, `PORT`, `SERVED_NAME`, `GLM53_ARGS` | `/models`, 1, 30000, `glm-5.3-flash`, empty | paths, port, model id, extra server args |

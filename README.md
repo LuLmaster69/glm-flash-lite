@@ -167,6 +167,9 @@ picks the mode, builds the store, measures, and tunes one setting at a time.
 - [docs/results.md](docs/results.md): every measured table, per mode, with dates and raw files
 - [docs/how-it-works.md](docs/how-it-works.md): the mechanisms, how each tier is sized, and every setting
 - [docs/b70-tier.md](docs/b70-tier.md): optional Intel Arc Pro B70 as a second expert tier (`GLM53_B70=1`)
+- [docs/how-it-works.md](docs/how-it-works.md#optional-refusal-direction-projection-exl3_ablit_runtime): optional
+  runtime refusal-direction projection (`EXL3_ABLIT_RUNTIME`, the yamz-labs uncensor spec), off by default, not
+  measured on this stack
 - [docs/troubleshooting.md](docs/troubleshooting.md): error messages and fixes
 - [docs/reference.md](docs/reference.md): the full campaign record (image smokes, quality method, reproduction pins)
 

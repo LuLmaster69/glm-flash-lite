@@ -10,6 +10,8 @@ Offload stack (each piece is a monkeypatch around stock exllamav3, enabled by en
   k_ftsplit.py     GLM53_K_FTSPLIT=1    faster CPU-tier split kernel (bit-identical)
   k_overlap.py     GLM53_K_OVL=1        shared expert on a side stream in decode (not bitwise: ~2e-3 rel per layer)
   k_lookahead.py   GLM53_LA=1           C1 decode lookahead: next step enqueued on the device token (bit-exact)
+  ablit.py         EXL3_ABLIT_RUNTIME   refusal-direction projection from an uncensor_spec.json (off unless a spec is
+                                        set or bundled in the model dir; --no-uncensor forces it off)
 
 Endpoints
   GET  /health, /v1/models, /server_info, /stats
@@ -46,7 +48,14 @@ def load():
     ap.add_argument("--max-batch-size", type=int, default=8)
     ap.add_argument("--served-name", default="glm-5.3-flash")
     ap.add_argument("--max-q-size", type=int, default=8)
+    ap.add_argument("--no-uncensor", action="store_true",
+                    help="ignore an uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     args = ap.parse_args()
+
+    if args.no_uncensor:
+        os.environ["EXL3_ABLIT_RUNTIME"] = "off"
+    import ablit
+    ablit.load(args.model_dir)   # before the model: a missing or malformed spec stops here, not after the load
 
     if os.environ.get("GLM53_ZC_VRAM"):
         import exl3_tiers
@@ -95,6 +104,7 @@ def load():
     if os.environ.get("GLM53_LA") == "1":   # N136: decode lookahead (next forward enqueued before the token is read)
         k_lookahead.install(model)
         k_lookahead.set_enabled(os.environ.get("GLM53_LA_ON", "1") == "1")
+    ablit.install(model)   # no-op without a spec; the main model only (the MTP draft is never edited)
     if os.environ.get("GLM53_NVTX") == "1" or os.environ.get("GLM53_PROF"):   # N136 profiling hooks (n136_prof.py)
         import n136_prof
         n136_prof.install(model)
@@ -520,6 +530,9 @@ async def stats():
     if os.environ.get("GLM53_NV") == "2":
         import nv2
         st["nv2"] = nv2.summary()
+    import ablit
+    if ablit.SPEC is not None:
+        st["ablit"] = ablit.summary()
     return JSONResponse(st)
 
 
