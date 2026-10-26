@@ -19,6 +19,8 @@ The container prints one `[glm53] ...` line for every check it makes at start. R
 | `no NVIDIA GPU visible` / `WARNING: N GPUs visible` | no GPU, or more than one, was passed in | pass exactly one: `--gpus '"device=0"'` |
 | ` !! nv2 ERROR flag N` followed by an exit | a device-side wait passed `GLM53_NV_TIMEOUT_S`: 1 reply timeout, 2 ring full, 3-5 fix, copy or CPU wait, 16-19 a read or allocation error | check `dmesg` for NVMe or PCIe errors (`nvme ... timeout`, `AER`, `pciehp`). Run `verify-store`. Stop serving if the kernel log shows link faults |
 | decode far below [results.md](results.md) | usually slow NVMe, a derived CPU layout, or a busy host | see "Slow decode" below |
+| `ablit runtime: spec file not found` / `direction file not found` / `is not valid JSON` | `EXL3_ABLIT_RUNTIME` names a file that is not mounted, or the direction is not next to the spec | mount the directory holding both `uncensor_spec.json` and `uncensor_direction.st` and point `EXL3_ABLIT_RUNTIME` at the spec inside the container, or set `EXL3_ABLIT_RUNTIME=off`. See [how-it-works.md](how-it-works.md#optional-refusal-direction-projection-exl3_ablit_runtime) |
+| no ` -- ablit runtime: spec ... active` line although the spec is set | the image predates `glm53/ablit.py` (the published digests do), or `--no-uncensor` / `EXL3_ABLIT_RUNTIME=off` is set | build the image from this checkout; check `docker inspect` for the env |
 | first answer after a long prompt arrives in bursts | an image older than `bb633b0b` (half-speed streaming) | use a current image. `python3 bench/stream_rate.py --url http://127.0.0.1:30000` passes when text arrives evenly |
 
 ## Slow decode
